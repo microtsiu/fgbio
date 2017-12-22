@@ -98,7 +98,7 @@ class DemuxFastqsTest extends UnitSpec with OptionValues with ErrorLogLevel {
   private def toSampleInfos(structures: Seq[ReadStructure]): Seq[SampleInfo] = {
     val samples: Seq[Sample] = {
       val sampleSheet = SampleSheet(this.sampleSheetPath).map(s => withCustomSampleBarcode(s, "Sample_Barcode"))
-      sampleSheet.toSeq :+ DemuxFastqs.unmatchedSample(sampleSheet.size, structures)
+      sampleSheet.toSeq :+ DemuxFastqs.unmatchedSample(sampleSheet.size+1, structures)
     }
     samples.map { sample => SampleInfo(sample=sample, isUnmatched=sample.sampleName==UnmatchedSampleId) }
   }
@@ -331,91 +331,103 @@ class DemuxFastqsTest extends UnitSpec with OptionValues with ErrorLogLevel {
     path
   }
 
-  Seq(1, 2).foreach { threads =>
-    Seq(true, false).foreach { useSampleSheet =>
-      OutputType.values.foreach { outputType =>
-        "DemuxFastqs" should s"run end-to-end with $threads threads using a ${if (useSampleSheet) "sample sheet" else "metadata CSV"} $outputType output" in {
+  (DemuxReaderOption.values.map(Some(_)) ++ Seq(None)).foreach { asyncReading =>
+    (DemuxWriterOption.values.map(Some(_)) ++ Seq(None))foreach { asyncWriting =>
+      val numWritingThreads = asyncWriting.map {
+        case DemuxWriterOption.NoAsync => 0
+        case DemuxWriterOption.Async   => 1
+      }
 
-          val output: DirPath = outputDir()
+      val asyncReadingMessage = asyncReading.map(_.toString).getOrElse("None")
+      val asyncWritingMessage = asyncWriting.map(_.toString).getOrElse("None")
 
-          val metrics = makeTempFile("metrics", ".txt")
-          val structures = Seq(ReadStructure("17B100T"))
+      Seq(true, false).foreach { useSampleSheet =>
+        val sampleSheetMessage  = if (useSampleSheet) "sample sheet" else "metadata CSV"
+        OutputType.values.foreach { outputType =>
+          "DemuxFastqs" should s"run end-to-end with async-reading=$asyncReadingMessage and async-writing=$asyncWritingMessage using a $sampleSheetMessage with $outputType output" in {
 
-          val metadata = if (useSampleSheet) sampleSheetPath else metadataPath
+            val output: DirPath = outputDir()
 
-          new DemuxFastqs(inputs=Seq(fastqPath), output=output, metadata=metadata,
-            readStructures=structures, metrics=Some(metrics), maxMismatches=2, minMismatchDelta=3,
-            threads=threads, outputType=Some(outputType)).execute()
+            val metrics = makeTempFile("metrics", ".txt")
+            val structures = Seq(ReadStructure("17B100T"))
 
-          val sampleInfos = toSampleInfos(structures)
-          val samples: Seq[Sample] = sampleInfos.map(_.sample)
+            val metadata = if (useSampleSheet) sampleSheetPath else metadataPath
 
-          // Check the BAMs
-          sampleInfos.foreach { sampleInfo =>
-            val sample = sampleInfo.sample
-            val prefix = toSampleOutputPrefix(sample, sampleInfo.isUnmatched, false, output, UnmatchedSampleId)
+            new DemuxFastqs(inputs=Seq(fastqPath), output=output, metadata=metadata,
+              readStructures=structures, metrics=Some(metrics), maxMismatches=2, minMismatchDelta=3,
+              asyncReading=asyncReading, asyncWritingThreads=numWritingThreads,
+              outputType=Some(outputType)).execute()
 
-            def checkOutput(names: Seq[String], sampleBarcodes: Seq[String]): Unit = {
+            val sampleInfos = toSampleInfos(structures)
+            val samples: Seq[Sample] = sampleInfos.map(_.sample)
+
+            // Check the BAMs
+            sampleInfos.foreach { sampleInfo =>
+              val sample = sampleInfo.sample
+              val prefix = toSampleOutputPrefix(sample, sampleInfo.isUnmatched, false, output, UnmatchedSampleId)
+
+              def checkOutput(names: Seq[String], sampleBarcodes: Seq[String]): Unit = {
+                if (sample.sampleOrdinal == 1) {
+                  names.length shouldBe 2
+                  names should contain theSameElementsInOrderAs Seq("frag1", "frag2")
+                  sampleBarcodes should contain theSameElementsInOrderAs Seq("AAAAAAAAGATTACAGA", "AAAAAAAAGATTACAGT")
+                }
+                else if (sample.sampleId == UnmatchedSampleId) {
+                  names.length shouldBe 3
+                  names should contain theSameElementsInOrderAs Seq("frag3", "frag4", "frag5")
+                  sampleBarcodes should contain theSameElementsInOrderAs Seq("AAAAAAAAGATTACTTT", "GGGGGGTTGATTACAGA", "AAAAAAAAGANNNNNNN") // NB: raw not assigned
+                }
+                else {
+                  names shouldBe 'empty
+                  sampleBarcodes.isEmpty shouldBe true
+                }
+              }
+
+              if (outputType.producesFastq) {
+                val fastq = PathUtil.pathTo(prefix + ".fastq.gz")
+                val records = FastqSource(fastq).toSeq
+                checkOutput(records.map(_.name.replaceAll(":.*", "")), records.map(_.name.replaceAll(".*:", "")))
+              }
+              if (outputType.producesBam) {
+                val bam = PathUtil.pathTo(prefix + ".bam")
+                val records = readBamRecs(bam)
+                checkOutput(records.map(_.name), records.map(_[String]("BC")))
+              }
+            }
+
+            // Check the metrics
+            val sampleBarcodMetrics = Metric.read[SampleBarcodeMetric](metrics)
+
+            sampleBarcodMetrics.length shouldBe samples.length
+
+            sampleBarcodMetrics.zip(samples).foreach { case (metric, sample) =>
+              metric.barcode_name shouldBe sample.sampleName
+              metric.barcode      shouldBe sample.sampleBarcodeString
+              metric.library_name shouldBe sample.libraryId
               if (sample.sampleOrdinal == 1) {
-                names.length shouldBe 2
-                names should contain theSameElementsInOrderAs Seq("frag1", "frag2")
-                sampleBarcodes should contain theSameElementsInOrderAs Seq("AAAAAAAAGATTACAGA", "AAAAAAAAGATTACAGT")
+                metric.reads                   shouldBe 2
+                metric.pf_reads                shouldBe 2
+                metric.perfect_matches         shouldBe 1
+                metric.one_mismatch_matches    shouldBe 1
+                metric.pf_perfect_matches      shouldBe 1
+                metric.pf_one_mismatch_matches shouldBe 1
               }
               else if (sample.sampleId == UnmatchedSampleId) {
-                names.length shouldBe 3
-                names should contain theSameElementsInOrderAs Seq("frag3", "frag4", "frag5")
-                sampleBarcodes should contain theSameElementsInOrderAs Seq("AAAAAAAAGATTACTTT", "GGGGGGTTGATTACAGA", "AAAAAAAAGANNNNNNN") // NB: raw not assigned
+                metric.reads                   shouldBe 3
+                metric.pf_reads                shouldBe 3
+                metric.perfect_matches         shouldBe 0
+                metric.one_mismatch_matches    shouldBe 0
+                metric.pf_perfect_matches      shouldBe 0
+                metric.pf_one_mismatch_matches shouldBe 0
               }
               else {
-                names shouldBe 'empty
-                sampleBarcodes.isEmpty shouldBe true
+                metric.reads                   shouldBe 0
+                metric.pf_reads                shouldBe 0
+                metric.perfect_matches         shouldBe 0
+                metric.one_mismatch_matches    shouldBe 0
+                metric.pf_perfect_matches      shouldBe 0
+                metric.pf_one_mismatch_matches shouldBe 0
               }
-            }
-
-            if (outputType.producesFastq) {
-              val fastq = PathUtil.pathTo(prefix + ".fastq.gz")
-              val records = FastqSource(fastq).toSeq
-              checkOutput(records.map(_.name.replaceAll(":.*", "")), records.map(_.name.replaceAll(".*:", "")))
-            }
-            if (outputType.producesBam) {
-              val bam = PathUtil.pathTo(prefix + ".bam")
-              val records = readBamRecs(bam)
-              checkOutput(records.map(_.name), records.map(_[String]("BC")))
-            }
-          }
-
-          // Check the metrics
-          val sampleBarcodMetrics = Metric.read[SampleBarcodeMetric](metrics)
-
-          sampleBarcodMetrics.length shouldBe samples.length
-
-          sampleBarcodMetrics.zip(samples).foreach { case (metric, sample) =>
-            metric.barcode_name shouldBe sample.sampleName
-            metric.barcode      shouldBe sample.sampleBarcodeString
-            metric.library_name shouldBe sample.libraryId
-            if (sample.sampleOrdinal == 1) {
-              metric.reads                   shouldBe 2
-              metric.pf_reads                shouldBe 2
-              metric.perfect_matches         shouldBe 1
-              metric.one_mismatch_matches    shouldBe 1
-              metric.pf_perfect_matches      shouldBe 1
-              metric.pf_one_mismatch_matches shouldBe 1
-            }
-            else if (sample.sampleId == UnmatchedSampleId) {
-              metric.reads                   shouldBe 3
-              metric.pf_reads                shouldBe 3
-              metric.perfect_matches         shouldBe 0
-              metric.one_mismatch_matches    shouldBe 0
-              metric.pf_perfect_matches      shouldBe 0
-              metric.pf_one_mismatch_matches shouldBe 0
-            }
-            else {
-              metric.reads                   shouldBe 0
-              metric.pf_reads                shouldBe 0
-              metric.perfect_matches         shouldBe 0
-              metric.one_mismatch_matches    shouldBe 0
-              metric.pf_perfect_matches      shouldBe 0
-              metric.pf_one_mismatch_matches shouldBe 0
             }
           }
         }
@@ -545,7 +557,7 @@ class DemuxFastqsTest extends UnitSpec with OptionValues with ErrorLogLevel {
 
     {
       val prefix = toSampleOutputPrefix(unmatchedSampleInfo.sample, unmatchedSampleInfo.isUnmatched, true, output, UnmatchedSampleId)
-      prefix.toString shouldBe output.resolve("unmatched_S4_L001").toString
+      prefix.toString shouldBe output.resolve("unmatched_S5_L001").toString
     }
   }
 
