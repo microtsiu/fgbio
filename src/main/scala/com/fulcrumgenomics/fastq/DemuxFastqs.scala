@@ -148,18 +148,18 @@ private object Async {
     require(bufferSize > 0, "bufferSize must be greater than zero")
     require(parallelism > 0, "parallelism must be greater than zero")
     private val _writers  = writers.toIndexedSeq
-    private val numGroups = math.ceil(this.writers.size / parallelism.toDouble).toInt
+    private val numWritersPerGroup = math.ceil(this.writers.size / parallelism.toDouble).toInt
 
     private val groupMapping: Map[Int, AsyncWriter[(T, Int)]] = this._writers
       .zipWithIndex // to associate each writer with an index
-      .grouped(numGroups)
+      .grouped(numWritersPerGroup)
       .flatMap { group: IndexedSeq[(Writer[T], Int)] =>
         val outer = this
         val writer = new Writer[(T, Int)] {
           def write(item: (T, Int)): Unit = outer._writers(item._2).write(item._1)
           def close(): Unit = group.foreach(_._1.close())
         }
-        val asyncWriter = new AsyncWriter[(T, Int)](writer=writer,bufferSize=bufferSize)
+        val asyncWriter = new AsyncWriter[(T, Int)](writer=writer, bufferSize=bufferSize)
         group.map(_._2 -> asyncWriter)
       }.toMap
 
@@ -168,7 +168,12 @@ private object Async {
       this.groupMapping(index).add((item, index))
     }
 
-    def close(): Unit = this.groupMapping.values.toSeq.distinct.foreach(_.close)
+    def close(): Unit = {
+      // close them asynchronously, since some writers may take a **long** time to close (I'm looking at you SamWriter).
+      import com.fulcrumgenomics.FgBioDef.ParSupport
+      val pool = new ForkJoinPool(parallelism)
+      this.groupMapping.values.toSeq.distinct.parWith(pool=pool).foreach(_.close())
+    }
   }
 }
 
