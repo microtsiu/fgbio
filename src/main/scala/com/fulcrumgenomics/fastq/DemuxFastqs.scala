@@ -26,7 +26,7 @@
 package com.fulcrumgenomics.fastq
 
 import java.io.Closeable
-import java.util.concurrent._
+import java.util.concurrent.{ArrayBlockingQueue, BlockingQueue}
 import java.util.concurrent.atomic.AtomicBoolean
 
 import com.fulcrumgenomics.FgBioDef.{FgBioEnum, unreachable}
@@ -50,6 +50,7 @@ import htsjdk.samtools.util.{AbstractAsyncWriter, Iso8601Date, SequenceUtil}
 
 import scala.collection.immutable.IndexedSeq
 import scala.collection.mutable.ListBuffer
+import scala.concurrent.forkjoin.ForkJoinPool
 
 private object Async {
   /** A [[Runnable]] who can be asked when it is all done.
