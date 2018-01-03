@@ -25,18 +25,13 @@
 
 package com.fulcrumgenomics.fastq
 
-import java.io.Closeable
-import java.util.concurrent.{ArrayBlockingQueue, BlockingQueue}
-import java.util.concurrent.atomic.AtomicBoolean
-
 import com.fulcrumgenomics.FgBioDef.{FgBioEnum, unreachable}
-import com.fulcrumgenomics.Writer
 import com.fulcrumgenomics.bam.api.{SamOrder, SamRecord, SamWriter}
 import com.fulcrumgenomics.cmdline.{ClpGroups, FgBioTool}
 import com.fulcrumgenomics.commons.CommonsDef.{DirPath, FilePath, PathPrefix, PathToFastq}
-import com.fulcrumgenomics.commons.io.PathUtil
+import com.fulcrumgenomics.commons.io.{PathUtil, Writer}
+import com.fulcrumgenomics.commons.util.Async._
 import com.fulcrumgenomics.commons.util.{LazyLogging, Logger}
-import com.fulcrumgenomics.fastq.Async._
 import com.fulcrumgenomics.fastq.FastqDemultiplexer.{DemuxRecord, DemuxResult}
 import com.fulcrumgenomics.illumina.{Sample, SampleSheet}
 import com.fulcrumgenomics.sopt.{arg, clp}
@@ -46,158 +41,21 @@ import com.fulcrumgenomics.util.{ReadStructure, SampleBarcodeMetric, _}
 import enumeratum.EnumEntry
 import htsjdk.samtools.SAMFileHeader.SortOrder
 import htsjdk.samtools._
-import htsjdk.samtools.util.{AbstractAsyncWriter, Iso8601Date, SequenceUtil}
+import htsjdk.samtools.util.{Iso8601Date, SequenceUtil}
 
 import scala.collection.immutable.IndexedSeq
 import scala.collection.mutable.ListBuffer
-import scala.concurrent.forkjoin.ForkJoinPool
-
-private object Async {
-  /** A [[Runnable]] who can be asked when it is all done.
-    *
-    * @param f the method to run
-    */
-  private case class Runner(f: () => Unit) extends Runnable {
-    private val allDone = new AtomicBoolean(false)
-    def run(): Unit = {
-      f()
-      this.allDone.set(true)
-    }
-    def done: Boolean = this.allDone.get()
-  }
-
-  /** An asynchronous wrapper for an [[Iterator]].  A separate thread will be created to consume the source iterator.
-    * Will buffer up to [[bufferSize]] elements before the blocking when consuming the source.
-    *
-    * @param source the source iterator to consume
-    * @param bufferSize the maximum number of elements to buffer before the blocking when consuming the source
-    * @tparam T the type of object to consume
-    */
-  class AsyncSource[T](val source: Iterator[T], bufferSize: Int) extends Iterator[T] {
-    require(bufferSize > 0, "bufferSize must be greater than zero")
-    private val queue: BlockingQueue[T] = new ArrayBlockingQueue[T](bufferSize)
-    private val outer = this
-    private val runnable = Runner(() => outer.source.foreach(outer.queue.put))
-    private val thread = {
-      val t = new Thread(runnable, getClass.getSimpleName)
-      t.setDaemon(true)
-      t.start()
-      t
-    }
-
-    def hasNext(): Boolean = {
-      if (!this.queue.isEmpty || this.source.nonEmpty) true
-      else { // both the queue and iterator were empty
-        // wait for the thread to finis
-        this.thread.join()
-        require(this.runnable.done, "Bug: runnable was not done when the thread was joined.")
-        !this.queue.isEmpty
-      }
-    }
-
-    def next(): T = this.queue.take()
-  }
-
-  /** An asynchronous wrapper for processing items. Delegates to [[AbstractAsyncWriter]] to asynchronously accept new
-    * items of type `T` and process them in a separate thread using the provided `sink` method.
-    *
-    * @param sink the method to invoke to process an object of type [[T]].
-    * @param bufferSize the number of elements to buffer before blocking when processing the elements
-    * @param source the optional source to close when this sink is closed.
-    * @tparam T the type of object to process
-    */
-  class AsyncSink[T](val sink: T => Unit, bufferSize: Int, val source: Option[{ def close(): Unit }] = None)
-    extends Closeable {
-    require(bufferSize > 0, "bufferSize must be greater than zero")
-    private val outer = this
-    private val asyncWriter = new AbstractAsyncWriter[T](bufferSize) {
-      protected def getThreadNamePrefix: String = "AsyncWriter"
-      protected def synchronouslyWrite(item: T): Unit = sink(item)
-      protected def synchronouslyClose(): Unit = outer.source.foreach(_.close())
-    }
-    def add(item: T): Unit = this.asyncWriter.write(item)
-    def close(): Unit = this.asyncWriter.close()
-  }
-
-  /** An asynchronous wrapper around a [[Writer]] class.
-    *
-    * @param writer the writer to wrap
-    * @param bufferSize the number of elements to buffer before blocking when writing the elements
-    * @tparam T the type of object to write
-    */
-  class AsyncWriter[T](val writer: Writer[T], bufferSize: Int)
-    extends AsyncSink[T](sink=writer.write, bufferSize=bufferSize, source=Some(writer))
-    with Writer[T] {
-    def write(item: T): Unit = this.add(item)
-  }
-
-  /** Asynchronously writes to multiple writers.  Groups the writers into `ceil(N, paralleism)` where `N` is the number
-    * of writers.  Creates a thread for each group to asynchronously write all elements that are written to writers
-    * in that group.
-    *
-    * @param writers the writers to which to write
-    * @param bufferSize the number of elements to buffer for each group of writers, before we block writing to writers
-    *                   in that group
-    * @param parallelism the maximum parallelism to use
-    * @param toIndex a method that returns the index into `writers` for each element to be written
-    * @tparam T the type of object to write
-    */
-  class AsyncGroupingWriter[T](writers: Traversable[Writer[T]],
-                               bufferSize: Int,
-                               parallelism: Int,
-                               val toIndex: T => Int) extends Writer[T] {
-    require(bufferSize > 0, "bufferSize must be greater than zero")
-    require(parallelism > 0, "parallelism must be greater than zero")
-    private val _writers  = writers.toIndexedSeq
-    private val numWritersPerGroup = math.ceil(this.writers.size / parallelism.toDouble).toInt
-
-    private val groupMapping: Map[Int, AsyncWriter[(T, Int)]] = this._writers
-      .zipWithIndex // to associate each writer with an index
-      .grouped(numWritersPerGroup)
-      .flatMap { group: IndexedSeq[(Writer[T], Int)] =>
-        val outer = this
-        val writer = new Writer[(T, Int)] {
-          def write(item: (T, Int)): Unit = outer._writers(item._2).write(item._1)
-          def close(): Unit = group.foreach(_._1.close())
-        }
-        val asyncWriter = new AsyncWriter[(T, Int)](writer=writer, bufferSize=bufferSize)
-        group.map(_._2 -> asyncWriter)
-      }.toMap
-
-    def write(item: T): Unit = {
-      val index = toIndex(item)
-      this.groupMapping(index).add((item, index))
-    }
-
-    def close(): Unit = {
-      // close them asynchronously, since some writers may take a **long** time to close (I'm looking at you SamWriter).
-      import com.fulcrumgenomics.FgBioDef.ParSupport
-      val pool = new ForkJoinPool(parallelism)
-      this.groupMapping.values.toSeq.distinct.parWith(pool=pool).foreach(_.close())
-    }
-  }
-}
 
 /** Controls how we read from the inputs in [[DemuxFastqs]].*/
-sealed trait DemuxReaderOption extends EnumEntry
-case object DemuxReaderOption extends FgBioEnum[DemuxReaderOption] {
-  def values: IndexedSeq[DemuxReaderOption] = findValues
+sealed trait DemuxFastqsAsyncReadingType extends EnumEntry
+case object DemuxFastqsAsyncReadingType extends FgBioEnum[DemuxFastqsAsyncReadingType] {
+  def values: IndexedSeq[DemuxFastqsAsyncReadingType] = findValues
   /** Read in a synchronous fashion */
-  case object NoAsync extends DemuxReaderOption
+  case object NoAsync extends DemuxFastqsAsyncReadingType
   /** Read all the inputs in a single thread */
-  case object SingleThread extends DemuxReaderOption
+  case object SingleThread extends DemuxFastqsAsyncReadingType
   /** Read each input in its own thread */
-  case object ThreadPerReader extends DemuxReaderOption
-}
-
-/** Controls how we write to the outputs in [[DemuxFastqs]] */
-sealed trait DemuxWriterOption extends EnumEntry
-case object DemuxWriterOption extends FgBioEnum[DemuxWriterOption] {
-  def values: IndexedSeq[DemuxWriterOption] = findValues
-  /** Write synchronously */
-  case object NoAsync extends DemuxWriterOption
-  /** Write asynchronously. */
-  case object Async extends DemuxWriterOption
+  case object ThreadPerReader extends DemuxFastqsAsyncReadingType
 }
 
 object DemuxFastqs {
@@ -209,16 +67,12 @@ object DemuxFastqs {
   val UnmatchedSampleId: String = "unmatched"
 
   /** Contains the parameters used to control asynchronous computation and IO. */
-  private case class ThreadOptions(readerOption: DemuxReaderOption,
-                                   writerOption: DemuxWriterOption,
-                                   numWriterThreads: Int,
-                                   demuxThreads: Boolean,
-                                   demuxBatchSize: Int) {
-    writerOption match {
-      case DemuxWriterOption.NoAsync => require(numWriterThreads == 0)
-      case DemuxWriterOption.Async => require(numWriterThreads > 0)
-    }
-    require(!demuxThreads || demuxBatchSize > 0)
+  private case class DemuxFastqsAsyncOptions(asyncReadingType: DemuxFastqsAsyncReadingType,
+                                             numWriterThreads: Int,
+                                             asyncDemux: Boolean,
+                                             demuxBatchSize: Int = 10e5.toInt) {
+    require(numWriterThreads >= 0)
+    require(!asyncDemux || demuxBatchSize > 0)
   }
 
   /** The maximum # of records in RAM per SAM/BAM writer. */
@@ -300,20 +154,19 @@ object DemuxFastqs {
     */
   def demultiplexingIterator(sources: Seq[Iterator[FastqRecord]],
                              demultiplexer: FastqDemultiplexer,
-                             readerOption: DemuxReaderOption,
-                             demuxThreads: Boolean,
-                             demuxBatchSize: Int): Iterator[DemuxResult] = {
+                             asyncOptions: DemuxFastqsAsyncOptions): Iterator[DemuxResult] = {
     require(demultiplexer.expectedNumberOfReads == sources.length,
       s"The demultiplexer expects ${demultiplexer.expectedNumberOfReads} reads but ${sources.length} FASTQ sources given.")
 
-    val demuxSource = readerOption match {
-      case DemuxReaderOption.NoAsync         => FastqSource.zipped(sources)
-      case DemuxReaderOption.SingleThread    => new AsyncSource(FastqSource.zipped(sources), bufferSize=1024)
-      case DemuxReaderOption.ThreadPerReader => FastqSource.zipped(sources.map { source => new AsyncSource(source, bufferSize=1024)})
+    val demuxSource = asyncOptions.asyncReadingType match {
+      case DemuxFastqsAsyncReadingType.NoAsync         => FastqSource.zipped(sources)
+      case DemuxFastqsAsyncReadingType.SingleThread    => new AsyncIterator(FastqSource.zipped(sources), bufferSize=1024)
+      case DemuxFastqsAsyncReadingType.ThreadPerReader => FastqSource.zipped(sources.map { source => new AsyncIterator(source, bufferSize=1024)})
     }
 
-    if (demuxThreads) {
-      new AsyncSource[DemuxResult](demuxSource.map { readRecords => demultiplexer.demultiplex(readRecords: _*) }, bufferSize=demuxBatchSize)
+    if (asyncOptions.asyncDemux) {
+      new AsyncIterator[DemuxResult](demuxSource.map { readRecords => demultiplexer.demultiplex(readRecords: _*) }, bufferSize=asyncOptions.demuxBatchSize)
+      // NB: We could enable multiple threads for demultiplexing with this in the future.
       // Developer Note: Iterator does not support parallel operations, so we need to group together records into a
       // [[List]] or [[Seq]].  A fixed number of records are grouped to reduce memory overhead.
       /*
@@ -441,19 +294,20 @@ object DemuxFastqs {
       |
       |A number of options allow fine-grain control over multi-threading and asynchronous input and output.
       |
-      |* The `--async-writing-threads` option allows reading from the input(s) asynchronously.
+      |* The `--async-reading-type-type` option allows reading from the input(s) asynchronously.
       |  * `NoAsync`: reads the input(s) synchronously (no threading).
       |  * `SingleThread`: reads the input(s) all in a single thread.
       |  * `ThreadPerReader`: reads each input in a seperate thread.
       |* The `--async-writing-threads` option enables writing the outputs in seperate thread(s).  If zero, the outputs
       |  are written synchronously (no threading).  Otherwise, the outputs are grouped into `N` groups, and a thread per
       |  group is created to write to the outputs in the given group.
-      |* The `--demux-threads` option enables the sample barcode matching (demultiplexing) to occur in a seperate thread.
-      |  * The `--demux-batch-size` controls how many templates are batched for asynchronous sample barcode matching
-      |    (demultiplexing)
+      |* The `--async-demux` option enables the sample barcode matching (demultiplexing) to occur in a seperate thread.
       |
       |The exact values for these options will depend on the output type (see `--output-type`), number of samples (which
-      |affects the number of different writers), and the number of inputs.
+      |affects the number of different writers), and the number of inputs.  It is recommended to use:
+      |  `--async-reading-type SingleThread --async-writing-threads N --async-demux`
+      |where N+2 is the # of cores you wish to use on your system.  In general, increasing `--async-writing-threads` has
+      |the greatest affect.
     """,
   group=ClpGroups.Fastq
 )
@@ -489,28 +343,28 @@ class DemuxFastqs
  @arg(doc="*** Deprecated: use --output-type instead ***. Output gzipped FASTQs (`.fastq.gz`) instead of BAM files", mutex=Array("outputType")) val outputFastqs: Option[Boolean] = None,
  @arg(doc="Output FASTQs according to Illumina naming standards, for example, for upload to the BaseSpace Sequence Hub") val illuminaStandards: Boolean = false,
  @deprecated("Use --use-threads instead", since="0.5.0")
- @arg(flag='t', doc="*** Deprecated: use --async-reading and --async-writing-threads instead *** The number of threads to use.", mutex=Array("asyncReading", "asyncWritingThreads")) val threads: Option[Int] = None,
- @arg(doc="Enables asynchronous reading of the inputs", mutex=Array("threads")) val asyncReading: Option[DemuxReaderOption] = None,
+ @arg(flag='t', doc="*** Deprecated: use --async-reading-type and --async-writing-threads instead *** The number of threads to use.", mutex=Array("asyncReading", "asyncWritingThreads")) val threads: Option[Int] = None,
+ @arg(doc="Enables asynchronous reading of the inputs", mutex=Array("threads")) val asyncReadingType: Option[DemuxFastqsAsyncReadingType] = None,
  @arg(doc="The number of threads to use for writing the outputs; zero to not use asynchronous writing", mutex=Array("threads")) val asyncWritingThreads: Option[Int] = None,
- @arg(doc="The number of threads to use for the demultiplexing operation (not IO).") demuxThreads: Boolean = false,
- @arg(doc="The number of templates to batch for the demultiplexing operation (with --demux-threads)") demuxBatchSize: Int = 1e5.toInt
+ @arg(doc="Enable a separate thread for the demultiplexing operation (not IO).") asyncDemux: Boolean = false
 ) extends FgBioTool with LazyLogging {
 
   import DemuxFastqs._
 
   private[fastq] val metricsPath = metrics.getOrElse(output.resolve(DefaultDemuxMetricsFileName))
 
-  validate(!this.demuxThreads || this.demuxBatchSize > 0, "--demux-batch-size must be greater than zero when --demux-threads is true.")
-
-  private val threadOptions = threads match {
-    case Some(0)              => ThreadOptions(readerOption=DemuxReaderOption.NoAsync, writerOption=DemuxWriterOption.NoAsync, 0, demuxThreads, demuxBatchSize)
-    case Some(thr)            => ThreadOptions(readerOption=DemuxReaderOption.SingleThread, writerOption=DemuxWriterOption.Async, math.max(1, thr-2), demuxThreads, demuxBatchSize)
+  private val asyncOptions = threads match {
+    case Some(thr)            =>
+      validate(this.asyncReadingType.isEmpty, "--async-reading-type cannot be used with --threads")
+      validate(this.asyncWritingThreads.isEmpty, "--async-writing-threads cannot be used with --threads")
+      if (thr == 0) DemuxFastqsAsyncOptions(asyncReadingType=DemuxFastqsAsyncReadingType.NoAsync, 0, asyncDemux)
+      else DemuxFastqsAsyncOptions(asyncReadingType=DemuxFastqsAsyncReadingType.SingleThread, math.max(1, thr-2), asyncDemux)
     case None                 =>
-      val readerOption = this.asyncReading.getOrElse(DemuxReaderOption.NoAsync)
+      val readerOption = this.asyncReadingType.getOrElse(DemuxFastqsAsyncReadingType.NoAsync)
       this.asyncWritingThreads match {
-        case Some(thr) if thr == 0 => ThreadOptions(readerOption=readerOption, writerOption=DemuxWriterOption.NoAsync, numWriterThreads=0, demuxThreads, demuxBatchSize)
-        case Some(thr) if thr > 0  => ThreadOptions(readerOption=readerOption, writerOption=DemuxWriterOption.Async, numWriterThreads=thr, demuxThreads, demuxBatchSize)
-        case None                  => ThreadOptions(readerOption=readerOption, writerOption=DemuxWriterOption.NoAsync, numWriterThreads=0, demuxThreads, demuxBatchSize)
+        case Some(thr) if thr == 0 => DemuxFastqsAsyncOptions(asyncReadingType=readerOption, numWriterThreads=0, asyncDemux)
+        case Some(thr) if thr > 0  => DemuxFastqsAsyncOptions(asyncReadingType=readerOption, numWriterThreads=thr, asyncDemux)
+        case None                  => DemuxFastqsAsyncOptions(asyncReadingType=readerOption, numWriterThreads=0, asyncDemux)
       }
   }
 
@@ -558,14 +412,14 @@ class DemuxFastqs
 
     // Some logging information about async reading and writing
     {
-      val readerMessage = this.threadOptions.readerOption match {
-        case DemuxReaderOption.NoAsync         => "not use async reading"
-        case DemuxReaderOption.SingleThread    => "use single-threaded async reading"
-        case DemuxReaderOption.ThreadPerReader => "use thread-per-input async reading"
+      val readerMessage = this.asyncOptions.asyncReadingType match {
+        case DemuxFastqsAsyncReadingType.NoAsync         => "not use async reading"
+        case DemuxFastqsAsyncReadingType.SingleThread    => "use single-threaded async reading"
+        case DemuxFastqsAsyncReadingType.ThreadPerReader => "use thread-per-input async reading"
       }
-      val writerMessage = this.threadOptions.writerOption match {
-        case DemuxWriterOption.NoAsync => "not use async writing"
-        case DemuxWriterOption.Async   => s"use ${this.threadOptions.numWriterThreads} threads for async writing"
+      val writerMessage = this.asyncWritingThreads match {
+        case None | Some(0) => "not use async writing"
+        case Some(thr)      => s"use $thr threads for async writing"
       }
       logger.info(s"Will $readerMessage and will $writerMessage")
     }
@@ -579,14 +433,14 @@ class DemuxFastqs
     val sampleInfos            = samples.map(sample => SampleInfo(sample, sample.sampleName == UnmatchedSampleId))
     val sampleToWriter         = sampleInfos.map { info => (info.sample, new DemuxResultWriter(toWriter(info, sampleInfos.length), qualityEncoding)) }
     val sampleWriter: Writer[DemuxResult] = {
-      this.threadOptions.writerOption match {
-        case DemuxWriterOption.NoAsync => new DemuxResultsBySampleWriter(sampleToWriter.toMap)
-        case DemuxWriterOption.Async =>
+      this.asyncWritingThreads match {
+        case None | Some(0) => new DemuxResultsBySampleWriter(sampleToWriter.toMap)
+        case Some(thr)      =>
           val writers = sampleToWriter.sortBy(_._1.sampleOrdinal).map(_._2)
           new AsyncGroupingWriter[DemuxResult](
             writers     = writers,
             bufferSize  = 1024,
-            parallelism = this.threadOptions.numWriterThreads,
+            parallelism = thr,
             toIndex     = result => result.sampleInfo.sample.sampleOrdinal-1
           )
       }
@@ -616,12 +470,10 @@ class DemuxFastqs
     val progress = ProgressLogger(this.logger, unit=1e6.toInt)
 
     val sources = inputs.map { input => FastqSource(input) }
-    val iterator      = demultiplexingIterator(
-      sources         = sources,
-      demultiplexer   = demultiplexer,
-      readerOption    = this.threadOptions.readerOption,
-      demuxThreads    = this.threadOptions.demuxThreads,
-      demuxBatchSize  = this.threadOptions.demuxBatchSize
+    val iterator    = demultiplexingIterator(
+      sources       = sources,
+      demultiplexer = demultiplexer,
+      asyncOptions  = this.asyncOptions
     )
 
     // Write the records out in its own thread

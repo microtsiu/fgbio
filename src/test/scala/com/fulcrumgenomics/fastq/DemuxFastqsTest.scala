@@ -331,15 +331,11 @@ class DemuxFastqsTest extends UnitSpec with OptionValues with ErrorLogLevel {
     path
   }
 
-  (DemuxReaderOption.values.map(Some(_)) ++ Seq(None)).foreach { asyncReading =>
-    (DemuxWriterOption.values.map(Some(_)) ++ Seq(None))foreach { asyncWriting =>
-      val numWritingThreads = asyncWriting.map {
-        case DemuxWriterOption.NoAsync => 0
-        case DemuxWriterOption.Async   => 1
-      }
+  (DemuxFastqsAsyncReadingType.values.map(Some(_)) ++ Seq(None)).foreach { asyncReading =>
+    Seq(0, 1).foreach { asyncWritingThreads =>
 
       val asyncReadingMessage = asyncReading.map(_.toString).getOrElse("None")
-      val asyncWritingMessage = asyncWriting.map(_.toString).getOrElse("None")
+      val asyncWritingMessage = s"$asyncWritingThreads"
 
       Seq(true, false).foreach { useSampleSheet =>
         val sampleSheetMessage  = if (useSampleSheet) "sample sheet" else "metadata CSV"
@@ -355,7 +351,7 @@ class DemuxFastqsTest extends UnitSpec with OptionValues with ErrorLogLevel {
 
             new DemuxFastqs(inputs=Seq(fastqPath), output=output, metadata=metadata,
               readStructures=structures, metrics=Some(metrics), maxMismatches=2, minMismatchDelta=3,
-              asyncReading=asyncReading, asyncWritingThreads=numWritingThreads,
+              asyncReadingType=asyncReading, asyncWritingThreads=Some(asyncWritingThreads),
               outputType=Some(outputType)).execute()
 
             val sampleInfos = toSampleInfos(structures)
