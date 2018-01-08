@@ -343,7 +343,7 @@ class DemuxFastqs
  @arg(doc="*** Deprecated: use --output-type instead ***. Output gzipped FASTQs (`.fastq.gz`) instead of BAM files", mutex=Array("outputType")) val outputFastqs: Option[Boolean] = None,
  @arg(doc="Output FASTQs according to Illumina naming standards, for example, for upload to the BaseSpace Sequence Hub") val illuminaStandards: Boolean = false,
  @deprecated("Use --use-threads instead", since="0.5.0")
- @arg(flag='t', doc="*** Deprecated: use --async-reading-type and --async-writing-threads instead *** The number of threads to use.", mutex=Array("asyncReading", "asyncWritingThreads")) val threads: Option[Int] = None,
+ @arg(flag='t', doc="*** Deprecated: use --async-reading-type and --async-writing-threads instead *** The number of threads to use.", mutex=Array("asyncReadingType", "asyncWritingThreads")) val threads: Option[Int] = None,
  @arg(doc="Enables asynchronous reading of the inputs", mutex=Array("threads")) val asyncReadingType: Option[DemuxFastqsAsyncReadingType] = None,
  @arg(doc="The number of threads to use for writing the outputs; zero to not use asynchronous writing", mutex=Array("threads")) val asyncWritingThreads: Option[Int] = None,
  @arg(doc="Enable a separate thread for the demultiplexing operation (not IO).") asyncDemux: Boolean = false
