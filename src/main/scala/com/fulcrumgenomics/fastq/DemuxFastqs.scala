@@ -45,6 +45,7 @@ import htsjdk.samtools.util.{Iso8601Date, SequenceUtil}
 
 import scala.collection.immutable.IndexedSeq
 import scala.collection.mutable.ListBuffer
+import scala.concurrent.forkjoin.ForkJoinPool
 
 /** Controls how we read from the inputs in [[DemuxFastqs]].*/
 sealed trait DemuxFastqsAsyncReadingType extends EnumEntry
@@ -183,6 +184,70 @@ object DemuxFastqs {
     }
     else {
       demuxSource.map { readRecords => demultiplexer.demultiplex(readRecords: _*) }
+    }
+  }
+
+
+  /** Asynchronously writes to multiple writers.  Groups the writers into `ceil(N, parallelism)` where `N` is the number
+    * of writers.  Creates a thread for each group to asynchronously write all elements that are written to writers
+    * in that group.
+    *
+    * @param writers the writers to which to write
+    * @param bufferSize the number of elements to buffer for each group of writers, before we block writing to writers
+    *                   in that group
+    * @param parallelism the maximum parallelism to use
+    * @param toIndex a method that returns the index into `writers` for each element to be written
+    * @tparam T the type of object to write
+    */
+  class AsyncGroupingWriter[T](writers: Traversable[Writer[T]],
+                               parallelism: Int,
+                               val toIndex: T => Int,
+                               bufferSize: Int = DefaultBufferSize
+                              ) extends Writer[T] {
+    require(writers.nonEmpty, "must supply at least one writer")
+    require(bufferSize > 0, "bufferSize must be greater than zero")
+    require(parallelism > 0, "parallelism must be greater than zero")
+
+    /** Gets the maximum # of writers grouped together. */
+    val numWritersPerGroup: Int = math.ceil(writers.size / parallelism.toDouble).toInt
+
+    // the writers, in order given
+    private val _writers  = writers.toIndexedSeq
+
+    // A mapping from the writer's index to the [[AsyncWriter]] that contains the writer
+    private val groupMapping: Map[Int, AsyncWriter[(T, Int)]] = this._writers
+      .zipWithIndex // to associate each writer with an index
+      .grouped(numWritersPerGroup)
+      .flatMap { group: IndexedSeq[(Writer[T], Int)] =>
+        val outer = this
+        // construct a new writer that writes to the writer at the given index
+        val groupWriter = new Writer[(T, Int)] {
+          def write(item: (T, Int)): Unit = outer._writers(item._2).write(item._1)
+          def close(): Unit = group.foreach(_._1.close())
+        }
+        // wrap the group writer so it writes asynchronously
+        val asyncGroupWriter = new AsyncWriter[(T, Int)](writer=groupWriter, bufferSize=bufferSize)
+        // map the index of the original writers to the asynchronous grouped writer
+        group.map(_._2 -> asyncGroupWriter)
+      }.toMap
+
+    /** Writes the given item.  Uses the [[toIndex]] method to determine which writer the item should be written.
+      *
+      * @param item the item to write.
+      */
+    def write(item: T): Unit = {
+      val index = toIndex(item)
+      this.groupMapping(index).add((item, index))
+    }
+
+    /** Closes all the underlying writers.  This occurs asynchronously to handle writers where closing may take a long,
+      * long time to complete.
+      */
+    def close(): Unit = {
+      // close them asynchronously, since some writers may take a **long** time to close (I'm looking at you SamWriter).
+      import com.fulcrumgenomics.commons.CommonsDef.ParSupport
+      val pool = new ForkJoinPool(parallelism)
+      this.groupMapping.values.toSeq.distinct.parWith(pool=pool).foreach(_.close())
     }
   }
 }

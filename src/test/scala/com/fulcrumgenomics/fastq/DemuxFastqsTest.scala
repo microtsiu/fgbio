@@ -37,7 +37,7 @@ import com.fulcrumgenomics.sopt.cmdline.ValidationException
 import org.scalatest.OptionValues
 
 import scala.collection.mutable.ListBuffer
-import scala.util.Try
+import scala.util.{Random, Try}
 
 class DemuxFastqsTest extends UnitSpec with OptionValues with ErrorLogLevel {
   import DemuxFastqs._
@@ -767,6 +767,37 @@ class DemuxFastqsTest extends UnitSpec with OptionValues with ErrorLogLevel {
       val rec    = baseRec.copy(pairedEnd=true, name="Instrument:RunID:FlowCellID:Lane:Tile:X:Y", comment=Some("ReadNum:FilterFlag:0:SampleNumber:Z"))
       val writer = new FastqRecordWriter(output.resolve("prefix"), pairedEnd=true, illuminaStandards=true)
       an[Exception] should be thrownBy writer.readName(rec)
+    }
+  }
+
+  "AsyncGroupingWriter" should "require at least one writer" in {
+    an[Exception] should be thrownBy new AsyncGroupingWriter[String](writers=Seq.empty, parallelism=1, toIndex = (s) => s.toInt)
+  }
+
+  {
+    val random = new Random(42)
+    val strings = Seq.range(start=0, end=1000).map { i =>
+      math.abs(random.nextInt).toString
+    }
+
+    Seq((2, 4, 1), (5, 3, 2), (3, 3, 1)).foreach { case (numWriters, parallelism, numWritersPerGroup) =>
+      val message = (numWriters, parallelism) match {
+        case (n, m) if n < m  => "N < M"
+        case (n, m) if n > m  => "N > M"
+        case (n, m) if n == m => "N == M"
+      }
+      it should s"write with N writers and M threads ($message)" in {
+
+        val writers = IndexedSeq.range(start=0, end=numWriters).map { _ => new StringWriter }
+        val writer  = new AsyncGroupingWriter[String](writers=writers, parallelism=parallelism, toIndex = (s) => s.toInt % numWriters)
+        writer.numWritersPerGroup shouldBe numWritersPerGroup
+        strings.foreach(writer.write)
+        writer.close()
+        writers.forall(_.closed) shouldBe true
+        strings.groupBy(_.toInt % numWriters).foreach { case (i, strs) =>
+          writers(i).items should contain theSameElementsInOrderAs strs
+        }
+      }
     }
   }
 }
