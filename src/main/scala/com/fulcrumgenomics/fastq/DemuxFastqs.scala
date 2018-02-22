@@ -29,8 +29,9 @@ import com.fulcrumgenomics.FgBioDef.{FgBioEnum, unreachable}
 import com.fulcrumgenomics.bam.api.{SamOrder, SamRecord, SamWriter}
 import com.fulcrumgenomics.cmdline.{ClpGroups, FgBioTool}
 import com.fulcrumgenomics.commons.CommonsDef.{DirPath, FilePath, PathPrefix, PathToFastq}
+import com.fulcrumgenomics.commons.async.Async
 import com.fulcrumgenomics.commons.io.{PathUtil, Writer}
-import com.fulcrumgenomics.commons.util.Async._
+import com.fulcrumgenomics.commons.async.Async._
 import com.fulcrumgenomics.commons.util.{LazyLogging, Logger}
 import com.fulcrumgenomics.fastq.FastqDemultiplexer.{DemuxRecord, DemuxResult}
 import com.fulcrumgenomics.illumina.{Sample, SampleSheet}
@@ -184,70 +185,6 @@ object DemuxFastqs {
     }
     else {
       demuxSource.map { readRecords => demultiplexer.demultiplex(readRecords: _*) }
-    }
-  }
-
-
-  /** Asynchronously writes to multiple writers.  Groups the writers into `ceil(N, parallelism)` where `N` is the number
-    * of writers.  Creates a thread for each group to asynchronously write all elements that are written to writers
-    * in that group.
-    *
-    * @param writers the writers to which to write
-    * @param bufferSize the number of elements to buffer for each group of writers, before we block writing to writers
-    *                   in that group
-    * @param parallelism the maximum parallelism to use
-    * @param toIndex a method that returns the index into `writers` for each element to be written
-    * @tparam T the type of object to write
-    */
-  class AsyncGroupingWriter[T](writers: Traversable[Writer[T]],
-                               parallelism: Int,
-                               val toIndex: T => Int,
-                               bufferSize: Int = DefaultBufferSize
-                              ) extends Writer[T] {
-    require(writers.nonEmpty, "must supply at least one writer")
-    require(bufferSize > 0, "bufferSize must be greater than zero")
-    require(parallelism > 0, "parallelism must be greater than zero")
-
-    /** Gets the maximum # of writers grouped together. */
-    val numWritersPerGroup: Int = math.ceil(writers.size / parallelism.toDouble).toInt
-
-    // the writers, in order given
-    private val _writers  = writers.toIndexedSeq
-
-    // A mapping from the writer's index to the [[AsyncWriter]] that contains the writer
-    private val groupMapping: Map[Int, AsyncWriter[(T, Int)]] = this._writers
-      .zipWithIndex // to associate each writer with an index
-      .grouped(numWritersPerGroup)
-      .flatMap { group: IndexedSeq[(Writer[T], Int)] =>
-        val outer = this
-        // construct a new writer that writes to the writer at the given index
-        val groupWriter = new Writer[(T, Int)] {
-          def write(item: (T, Int)): Unit = outer._writers(item._2).write(item._1)
-          def close(): Unit = group.foreach(_._1.close())
-        }
-        // wrap the group writer so it writes asynchronously
-        val asyncGroupWriter = new AsyncWriter[(T, Int)](writer=groupWriter, bufferSize=bufferSize)
-        // map the index of the original writers to the asynchronous grouped writer
-        group.map(_._2 -> asyncGroupWriter)
-      }.toMap
-
-    /** Writes the given item.  Uses the [[toIndex]] method to determine which writer the item should be written.
-      *
-      * @param item the item to write.
-      */
-    def write(item: T): Unit = {
-      val index = toIndex(item)
-      this.groupMapping(index).add((item, index))
-    }
-
-    /** Closes all the underlying writers.  This occurs asynchronously to handle writers where closing may take a long,
-      * long time to complete.
-      */
-    def close(): Unit = {
-      // close them asynchronously, since some writers may take a **long** time to close (I'm looking at you SamWriter).
-      import com.fulcrumgenomics.commons.CommonsDef.ParSupport
-      val pool = new ForkJoinPool(parallelism)
-      this.groupMapping.values.toSeq.distinct.parWith(pool=pool).foreach(_.close())
     }
   }
 }
@@ -497,16 +434,17 @@ class DemuxFastqs
     val samples                = samplesFromSampleSheet.toSeq :+ unmatchedSample(samplesFromSampleSheet.size+1, this.readStructures)
     val sampleInfos            = samples.map(sample => SampleInfo(sample, sample.sampleName == UnmatchedSampleId))
     val sampleToWriter         = sampleInfos.map { info => (info.sample, new DemuxResultWriter(toWriter(info, sampleInfos.length), qualityEncoding)) }
-    val sampleWriter: Writer[DemuxResult] = {
+    val sampleWriter: Writer[(DemuxResult, Int)] = {
       this.asyncWritingThreads match {
-        case None | Some(0) => new DemuxResultsBySampleWriter(sampleToWriter.toMap)
+        case None | Some(0) =>
+          val sampleIndexToWriterMap = sampleToWriter.map { case (sample, writer) => (sample.sampleOrdinal-1, writer) }.toMap
+          new DemuxResultsBySampleIndexWriter(sampleIndexToWriterMap)
         case Some(thr)      =>
           val writers = sampleToWriter.sortBy(_._1.sampleOrdinal).map(_._2)
-          new AsyncGroupingWriter[DemuxResult](
+          new AsyncMultiWriter[DemuxResult](
             writers     = writers,
             bufferSize  = 1024,
-            parallelism = thr,
-            toIndex     = result => result.sampleInfo.sample.sampleOrdinal-1
+            parallelism = thr
           )
       }
     }
@@ -544,7 +482,7 @@ class DemuxFastqs
     // Write the records out in its own thread
     iterator.foreach { demuxResult =>
       demuxResult.sampleInfo.metric.increment(numMismatches=demuxResult.numMismatches)
-      sampleWriter.write(demuxResult)
+      sampleWriter.write(demuxResult, demuxResult.sampleInfo.sample.sampleOrdinal-1)
       demuxResult.records.foreach { _ => progress.record() }
     }
 
@@ -597,10 +535,13 @@ class DemuxFastqs
   }
 }
 
-/** Writes a [[DemuxResult]] to its associated writer given a map between [[Sample]] and it's [[Writer]]. */
-private class DemuxResultsBySampleWriter(val sampleToWriter: Map[Sample, Writer[DemuxResult]]) extends Writer[DemuxResult] {
-  def write(item: DemuxResult): Unit = sampleToWriter(item.sampleInfo.sample).write(item)
-  def close(): Unit = this.sampleToWriter.values.foreach(_.close())
+/** Writes a [[DemuxResult]] to its associated writer given a map between the sample index and it's [[Writer. */
+private class DemuxResultsBySampleIndexWriter(val sampleIndexToWriterMap: Map[Int, Writer[DemuxResult]]) extends Writer[(DemuxResult, Int)] {
+  def write(itemAndIndex: (DemuxResult, Int)): Unit = {
+    val (item, sampleIndex) = itemAndIndex
+    sampleIndexToWriterMap(sampleIndex).write(item)
+  }
+  def close(): Unit = this.sampleIndexToWriterMap.values.foreach(_.close())
 }
 
 /** A write that writes the records in [[DemuxResult]] to the given [[DemuxRecordWriter]]. */
