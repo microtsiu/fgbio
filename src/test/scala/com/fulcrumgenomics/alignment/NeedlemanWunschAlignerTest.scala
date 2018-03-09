@@ -295,6 +295,15 @@ class NeedlemanWunschAlignerTest extends UnitSpec {
     result.cigar.toString shouldBe "4=4I4="
   }
 
+  it should "align a query with leading and trailing gaps" in {
+    val q = s("-------------------GGTTTTAGAGCTAGAAATAGCAAGTTAAAATAAGGCTAGTCCGTTATCAACTTG---------------------------")
+    val t = s("AGGGCTATAGACTGCTAGAGGTTTTAGAGCTAGAAATAGCAAGTTAAAATAAGGCTAGTCCGTTATCAACTTGAAATGAGCTATTAGTCATGACGCTTTT")
+    val result = NeedlemanWunschAligner(1, -3, -3, -1).align(q, t)
+    assertValidGlobalAlignment(result)
+    result.cigar.toString() shouldBe "19D54=27D"
+    result.score shouldBe 54 - (1*19 + 3) - (1*27 + 3)
+  }
+
   "NeedlemanWunschAligner.align(Local)" should "align two identical sequences with all matches" in {
     val result = NeedlemanWunschAligner(1, -1, -3, -1, mode=Local).align(s("ACGTAACC"), s("ACGTAACC"))
     assertValidLocalAlignment(result)
