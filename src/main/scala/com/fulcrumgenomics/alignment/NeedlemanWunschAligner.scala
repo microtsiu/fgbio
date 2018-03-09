@@ -62,10 +62,10 @@ object NeedlemanWunschAligner {
 
   /** Directions within the trace back matrix. */
   type Direction = Byte
-  val Left: Direction     = 1.toByte
-  val Up  : Direction     = 2.toByte
-  val Diagonal: Direction = 3.toByte
-  val Done: Direction     = 4.toByte
+  val Left: Direction     = 0.toByte
+  val Up  : Direction     = 1.toByte
+  val Diagonal: Direction = 2.toByte
+  val Done: Direction     = 3.toByte
 
   // NB: the order of LeftAndDiagonal and UpAndDiagonal matters when breaking ties!
   val AllDirections: Seq[Direction]   = Seq(Diagonal, Left, Up)
@@ -136,12 +136,17 @@ class NeedlemanWunschAligner(val scoringFunction: (Byte,Byte) => Int,
     *
     * @param query the query sequence
     * @param target the target sequence
-    * @return a tuple of the scoring matrix and the traceback matrix
+    * @return an array of alignment matrices, where the indices to the array are the Directions
     */
-  protected def buildMatrices(query: Array[Byte], target: Array[Byte]): Map[Direction, AlignmentMatrix] = {
-    val matrices = Seq(Diagonal, Left, Up).map { direction =>
-      direction -> AlignmentMatrix(direction=direction, queryLength=query.length, targetLength=target.length)
-    }.toMap
+  protected def buildMatrices(query: Array[Byte], target: Array[Byte]): Array[AlignmentMatrix] = {
+    val matrices = AllDirections.sorted.map(dir => AlignmentMatrix(direction=dir, queryLength=query.length, targetLength=target.length)).toArray
+
+    // While we have `matrices` above, it's useful to unpack all the matrices for direct access
+    // in the core loop; when we know the exact matrix we need at compile time, it's faster
+    val (leftScoreMatrix, leftTraceMatrix, upScoreMatrix, upTraceMatrix, diagScoreMatrix, diagTraceMatrix) = {
+      val Seq(l, u, d) = Seq(Left, Up, Diagonal).map(_.toInt).map(matrices.apply)
+      (l.scoring, l.trace, u.scoring, u.trace, d.scoring, d.trace)
+    }
 
     // Top left corner - allow all to be zero score but then must be careful to initialize Up and Left to have a gap open
     AllDirections.foreach { direction =>
@@ -196,35 +201,68 @@ class NeedlemanWunschAligner(val scoringFunction: (Byte,Byte) => Int,
     }
 
     // The interior of the matrix
-    forloop(from=1, until=query.length+1) { i =>
-      forloop(from=1, until=target.length+1) { j =>
-        // Diagonal matrix can come from the previous diagonal, up, or left
-        val maxDiagDirection = AllDirections.maxBy(direction => matrices(direction).scoring(i-1, j-1))
-        matrices(Diagonal).scoring(i, j) = matrices(maxDiagDirection).scoring(i-1, j-1) + scoringFunction(query(i-1), target(j-1))
-        matrices(Diagonal).trace(i, j)   = maxDiagDirection
-        assert(maxDiagDirection == Diagonal || matrices(maxDiagDirection).scoring(i-1, j-1) > matrices(Diagonal).scoring(i-1, j-1))
-        // For local mode, we can start anywhere.  We use < 0 to prefer longer alignments
-        if (mode == Local && matrices(Diagonal).scoring(i, j) < 0) {
-          matrices(Diagonal).scoring(i, j) = 0
-          matrices(Diagonal).trace(i, j)   = Done
+    var i = 1
+    while (i <= query.length) {
+      val queryBase = query(i-1)
+      var j = 1
+
+      while (j <= target.length) {
+        { // Diagonal matrix can come from the previous diagonal, up, or left
+          val addend = scoringFunction(queryBase, target(j-1))
+          val dScore = diagScoreMatrix(i-1, j-1) + addend
+          val lScore = leftScoreMatrix(i-1, j-1) + addend
+          val uScore = upScoreMatrix(i-1, j-1)   + addend
+
+          if (mode == Local && dScore < 0 && lScore < 0 && uScore < 0) {
+            diagScoreMatrix(i, j) = 0
+            diagTraceMatrix(i, j) = Done
+          }
+          else if (dScore >= uScore && dScore >= lScore) {
+            diagScoreMatrix(i, j) = dScore
+            diagTraceMatrix(i, j) = Diagonal
+          }
+          else if (lScore >= uScore) {
+            diagScoreMatrix(i, j) = lScore
+            diagTraceMatrix(i, j) = Left
+          }
+          else {
+            diagScoreMatrix(i, j) = uScore
+            diagTraceMatrix(i, j) = Up
+          }
         }
 
-        // Up matrix can come from diagonal or up
-        val maxUpDirection = UpAndDiagonal.maxBy { direction =>
-          val gapPenalty = gapExtend + (if (direction == Up) 0 else gapOpen)
-          matrices(direction).scoring(i-1, j) + gapPenalty
-        }
-        matrices(Up).scoring(i, j) = matrices(maxUpDirection).scoring(i-1, j) + gapExtend + (if (maxUpDirection == Up) 0 else gapOpen)
-        matrices(Up).trace(i, j)   = maxUpDirection
 
-        // Left matrix can come from diagonal or left
-        val maxLeftDirection = LeftAndDiagonal.maxBy { direction =>
-          val gapPenalty = gapExtend + (if (direction == Left) 0 else gapOpen)
-          matrices(direction).scoring(i, j-1) + gapPenalty
+        { // Up matrix can come from diagonal or up
+          val dScore = gapOpen + diagScoreMatrix(i-1, j)
+          val uScore =           upScoreMatrix(i-1, j)
+          if (dScore >= uScore) {
+            upScoreMatrix(i, j) = dScore + gapExtend
+            upTraceMatrix(i, j) = Diagonal
+          }
+          else {
+            upScoreMatrix(i, j) = uScore + gapExtend
+            upTraceMatrix(i, j) = Up
+          }
         }
-        matrices(Left).scoring(i, j) = matrices(maxLeftDirection).scoring(i, j-1) + gapExtend + (if (maxLeftDirection == Left) 0 else gapOpen)
-        matrices(Left).trace(i, j)   = maxLeftDirection
+
+
+        { // Left matrix can come from diagonal or left
+          val dScore = gapOpen + diagScoreMatrix(i, j-1)
+          val lScore =           leftScoreMatrix(i, j-1)
+          if (dScore >= lScore) {
+            leftScoreMatrix(i, j) = dScore + gapExtend
+            leftTraceMatrix(i, j) = Diagonal
+          }
+          else {
+            leftScoreMatrix(i, j) = lScore + gapExtend
+            leftTraceMatrix(i, j) = Left
+          }
+        }
+
+        j += 1
       }
+
+      i += 1
     }
 
     matrices
@@ -239,7 +277,7 @@ class NeedlemanWunschAligner(val scoringFunction: (Byte,Byte) => Int,
     * @param matrices the scoring and trace back matrices for the [[Left]], [[Up]], and [[Diagonal]] directions.
     * @return an [[Alignment]] object representing the alignment
     */
-  protected def generateAlignment(query: Array[Byte], target: Array[Byte], matrices: Map[Direction, AlignmentMatrix]): Alignment = {
+  protected def generateAlignment(query: Array[Byte], target: Array[Byte], matrices: Array[AlignmentMatrix]): Alignment = {
     var currOperator: CigarOperator = null
     var currLength: Int = 0
     val elems = new mutable.ArrayBuffer[CigarElem]()
