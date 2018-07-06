@@ -101,7 +101,8 @@ class HapCutToVcf
   @arg(flag='o', doc="The output VCF with both phased and unphased variants.") val output: PathToVcf,
   @arg(flag='r', doc="Output phased variants in GATK's `ReadBackedPhasing` format.") val gatkPhasingFormat: Boolean = false,
   @arg(          doc="Fix IUPAC codes in the original VCF to be VCF 4.3 spec-compliant (ex 'R' -> 'A').  Does not support BCF inputs.")
-  val fixAmbiguousReferenceAlleles: Boolean = false
+  val fixAmbiguousReferenceAlleles: Boolean = false,
+  @arg(          doc="Index the output VCF") val createIndex: Boolean = true
 ) extends FgBioTool with LazyLogging {
   import HapCutType._
   import HapCutToVcf.IupacToBase
@@ -157,7 +158,12 @@ class HapCutToVcf
       .setOption(Options.INDEX_ON_THE_FLY)
       .setOption(Options.WRITE_FULL_FORMAT_FIELD)
       .setOption(Options.ALLOW_MISSING_FIELDS_IN_HEADER)
-    val writer: VariantContextWriter = builder.build
+    val writer: VariantContextWriter = if (this.createIndex) {
+      builder.setOption(Options.INDEX_ON_THE_FLY).build
+    }
+    else {
+      builder.build
+    }
 
     // get the header lines in the input header that we wish to skip/replace with our own definitions
     val headerLinesToSkip = HeaderLines.formatHeaderKeys(hapCutType).flatMap(key => Option(inputHeader.getFormatHeaderLine(key)))
