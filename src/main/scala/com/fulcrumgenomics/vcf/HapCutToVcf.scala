@@ -32,8 +32,10 @@ import java.util.NoSuchElementException
 import com.fulcrumgenomics.cmdline.{ClpGroups, FgBioTool}
 import com.fulcrumgenomics.util.Io
 import com.fulcrumgenomics.FgBioDef._
+import com.fulcrumgenomics.commons.io.PathUtil
 import com.fulcrumgenomics.commons.util.LazyLogging
 import com.fulcrumgenomics.sopt._
+import htsjdk.samtools.util.SequenceUtil
 import htsjdk.variant.variantcontext._
 import htsjdk.variant.variantcontext.writer.{Options, VariantContextWriter, VariantContextWriterBuilder}
 import htsjdk.variant.vcf._
@@ -97,16 +99,19 @@ class HapCutToVcf
 ( @arg(flag='v', doc="The original VCF provided to `HapCut1`/`HapCut2`.") val vcf: PathToVcf,
   @arg(flag='i', doc="The file produced by `HapCut1`/`HapCut2`.") val input: FilePath,
   @arg(flag='o', doc="The output VCF with both phased and unphased variants.") val output: PathToVcf,
-  @arg(flag='r', doc="Output phased variants in GATK's `ReadBackedPhasing` format.") val gatkPhasingFormat: Boolean = false
+  @arg(flag='r', doc="Output phased variants in GATK's `ReadBackedPhasing` format.") val gatkPhasingFormat: Boolean = false,
+  @arg(          doc="Fix IUPAC codes in the original VCF to be VCF 4.3 spec-compliant (ex 'R' -> 'A').  Does not support BCF inputs.")
+  val fixAmbiguousReferenceAlleles: Boolean = false
 ) extends FgBioTool with LazyLogging {
   import HapCutType._
+  import HapCutToVcf.IupacToBase
 
   Io.assertReadable(vcf)
   Io.assertReadable(input)
   Io.assertCanWriteFile(output)
 
   override def execute(): Unit = {
-    val vcfReader = new VCFFileReader(vcf.toFile, false)
+    val vcfReader = new VCFFileReader(inputVcf.toFile, false)
     val iterator  = new HapCutAndVcfMergingIterator(input, vcfReader, gatkPhasingFormat)
     val vcfWriter = makeWriter(output, vcfReader, iterator.hapCutType)
 
@@ -115,6 +120,32 @@ class HapCutToVcf
     vcfReader.safelyClose()
     iterator.safelyClose()
     vcfWriter.close()
+  }
+
+  /** If fixing ambiguous (IUPAC) bases is desired, returns a new path to a VCF, otherwise returns the original input VCF. */
+  private def inputVcf: FilePath = if (!fixAmbiguousReferenceAlleles) this.vcf else {
+
+    val inputLines = PathUtil.extensionOf(this.vcf) match {
+      case Some(".vcf") => Io.readLines(this.vcf)
+      case Some(".vcf.gz")  =>
+        val stream = Io.toInputStream(this.vcf)
+        Source.fromInputStream(stream).withClose(() => stream.close()).getLines()
+      case Some(".bcf") => throw new IllegalArgumentException(s"BCF not supported when fixing ambiguity codes in: ${this.vcf}")
+      case _            => throw new IllegalArgumentException(s"Could not determine file type from ${this.vcf}")
+    }
+    val outputLines = inputLines.map { line =>
+      if (line.startsWith("#")) line else {
+        val items = line.split('\t')
+        val bases = items(3).map { base =>
+          val baseUpper = base.toUpper
+          IupacToBase.getOrElse(baseUpper, baseUpper)
+        }.mkString("")
+        (items.take(3) ++ Seq(bases) ++ items.drop(4)).mkString("\t")
+      }
+    }
+    val newVcf = Io.makeTempFile(PathUtil.basename(this.vcf.getFileName), ".vcf", dir=Some(Io.tmpDir))
+    Io.writeLines(newVcf, outputLines)
+    newVcf
   }
 
   /** Creates a VCF writer, adding extra header lines if the output is the phased VCF. */
@@ -169,6 +200,22 @@ object HeaderLines {
       case _       => Seq.empty // empty file
     }
   }
+}
+
+object HapCutToVcf {
+  val IupacToBase: Map[Char, Char] = Map(
+    'M' -> 'A',
+    'R' -> 'A',
+    'W' -> 'A',
+    'S' -> 'C',
+    'Y' -> 'C',
+    'K' -> 'G',
+    'V' -> 'A',
+    'H' -> 'A',
+    'D' -> 'A',
+    'B' -> 'C',
+    'N' -> 'A'
+  )
 }
 
 trait HeaderLines {
@@ -267,7 +314,7 @@ private class HapCutAndVcfMergingIterator(hapCutPath: FilePath,
         case None =>
           formatSourceContext(sourceContext)
         case Some(hapCutCall) =>
-          require(hapCutCall.pos == sourceContext.getStart)
+          require(hapCutCall.pos == sourceContext.getStart, s"${hapCutCall.pos} ${sourceContext.getStart}")
           require(offset == hapCutCall.offset)
           val hapCutContext = hapCutCall.toVariantContext(sampleName)
           replaceGenotypes(source=sourceContext, genotype=hapCutContext.getGenotype(0), isPhased = !gatkPhasingFormat || !hapCutCall.firstInBlock)
@@ -542,6 +589,7 @@ private case class HapCutCall private(block: BlockInfo,
 
 private object HapCutCall {
   import HapCutType._
+  import HapCutToVcf.IupacToBase
 
   /** Parse a variant line.
     *
@@ -559,6 +607,7 @@ private object HapCutCall {
     val hap1Allele = if ("-" == tokens(1)) -1 else tokens(1).toInt
     val hap2Allele = if ("-" == tokens(2)) -1 else tokens(2).toInt
     val thresholdPruning = hapCutType == HapCut2 && (hap1Allele < 0 || hap2Allele < 0)
+    val ref: String = tokens(5).map(b => IupacToBase.getOrElse(b.toUpper, b.toUpper))
     new HapCutCall(
       block        = block,
       offset       = offset,
@@ -566,7 +615,7 @@ private object HapCutCall {
       hap2Allele   = hap2Allele,
       contig       = tokens(3),
       pos          = pos,
-      ref          = tokens(5),
+      ref          = ref,
       alts         = tokens(6),
       genotype     = tokens(7),
       info         = GenotypeInfo(tokens.drop(8).mkString("\t"), hapCutType=hapCutType, missingAlleles=(hap1Allele < 0 || hap2Allele < 0), thresholdPruning=thresholdPruning),

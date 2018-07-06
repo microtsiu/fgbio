@@ -63,6 +63,11 @@ class HapCutToVcfTest extends UnitSpec with ParallelTestExecution {
   private val skipPruneIn          = dir.resolve("skip_prune.hapcut2")
   private val withSwitchErrors     = dir.resolve("with_switch_errors.hapcut2")
 
+  // For testing HapCutToVcf with IUPAC codes
+  private val withIupacIn     = dir.resolve("with_iupac.vcf")
+  private val withIupacOut    = dir.resolve("with_iupac.hapcut")
+  private val withIupacOutVcf = dir.resolve("with_iupac.hapcut.vcf")
+
   private def countVcfRecords(vcf: PathToVcf): Int = {
     val vcfReader = new VCFFileReader(vcf.toFile, false)
     yieldAndThen(vcfReader.iterator().length)(vcfReader.close())
@@ -327,6 +332,33 @@ class HapCutToVcfTest extends UnitSpec with ParallelTestExecution {
       // check that if a variant is not phased it does not have a PS tag
       hasPhasingSetFormatTagButUnphased(out, false) shouldBe false
     }
+  }
+
+  it should "fail when IUPAC codes are found in the VCF" in {
+    val out = makeTempFile("hap_cut_to_vcf.hapcut", ".vcf")
+    an[Exception] should be thrownBy new HapCutToVcf(
+      vcf                          = withIupacIn,
+      input                        = withIupacOut,
+      output                       = out,
+      gatkPhasingFormat            = false,
+      fixAmbiguousReferenceAlleles = false
+    ).execute()
+  }
+
+  it should "succeed when IUPAC codes are found in the VCF and --fix-ambiguous-reference-alleles is specified" in {
+    val out = makeTempFile("hap_cut_to_vcf.hapcut", ".vcf")
+
+    new HapCutToVcf(
+      vcf                          = withIupacIn,
+      input                        = withIupacOut,
+      output                       = out,
+      gatkPhasingFormat            = false,
+      fixAmbiguousReferenceAlleles = true
+    ).execute()
+
+    // check the reference alleles are not IUPAC
+    val referenceBases = Io.readLines(out).filterNot(_.startsWith("#")).flatMap(_.split('\t')(3)).mkString("")
+    referenceBases shouldBe "CCTGCCTG" // last G changed from K
   }
 
   "HapCutToVcf.HapCut2GenotypeInfo" should "ignore the values of pruned, SE, and NE when they are '.'" in {
