@@ -483,7 +483,7 @@ class GroupReadsByUmi
       // Take the next set of pairs by position and assign UMIs
       val pairs = takeNextGroup(iterator)
       pairs.foreach { case(r1, r2) =>
-        assert(r1.name == r2.name && r1.firstOfPair && r2.secondOfPair, s"Reads out of order @ ${r1.id} + ${r2.id}")
+        assert(r1.name == r2.name && r1.firstOfPair && r2.secondOfPair, getReadsOutOfOrderErrorMessage(r1, r2))
       }
       assignUmiGroups(pairs)
 
@@ -512,6 +512,20 @@ class GroupReadsByUmi
         ms.tails.foreach { tail => tail.headOption.foreach(m => m.fraction_gt_or_eq_family_size = tail.map(_.fraction).sum) }
         Metric.write(p, ms)
     }
+  }
+
+  /** The error message when reads are out of order. */
+  private def getReadsOutOfOrderErrorMessage(r1: SamRecord, r2: SamRecord): String = {
+    val errorMessage = if (this.rawTag == "MI") {
+      s"Using 'MI' tag as the 'raw tag', are you sure this is correct?  Did you mean the 'RX' tag?"
+    }
+    else if (this.rawTag == this.assignTag) {
+      s"Overwriting '${rawTag}', are you sure this is correct?"
+    }
+    else {
+      s"Are you sure the raw tag ('${rawTag}') is correct?"
+    }
+    s"Reads out of order @ ${r1.id} + ${r2.id}\n$errorMessage"
   }
 
   /** Consumes the next group of pairs with all matching end positions and returns them. */
